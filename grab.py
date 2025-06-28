@@ -1,99 +1,148 @@
 #!/usr/bin/env python3
+"""
+grab.py — improved pagination robustness, uniform parsing for online/offline, incremental CSV saves, and better debugging
+
+Usage:
+  # Offline mode: parse a saved HTML page using the same parser as online
+  python grab.py offline test.html fall2025.csv
+
+  # Online mode: run Selenium for a term
+  python grab.py online --term "2025 Fall De Anza" --output fall2025.csv [--save-html sample.html] [--debug]
+
+  # Debug tip:
+  #  If pagination stalls, run with --debug to save HTML snapshots of each page for inspection.
+"""
+
+import argparse
+import time
+import pandas as pd
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-import pandas as pd
-import time
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
-# ─── SETTINGS ────────────────────────────────────────────────────────────────
-OUTPUT_CSV = "summer_courses.csv"
-TERM_NAME = "2025 Summer De Anza"
 
-# ─── SELENIUM SETUP ──────────────────────────────────────────────────────────
-options = Options()
-# Comment out headless if you want to watch it:
-# options.add_argument("--headless")
-options.add_argument("--start-maximized")
-# keep browser open after script ends
-driver = webdriver.Chrome(options=options)
-wait = WebDriverWait(driver, 20)
+def parse_meeting_cell(cell_html: str) -> str:
+    soup = BeautifulSoup(cell_html, "html.parser")
+    day_map = {"Sunday":"Su","Monday":"M","Tuesday":"Tu","Wednesday":"W","Thursday":"Th","Friday":"F","Saturday":"Sa"}
+    meetings = []
+    for meeting_div in soup.select("div.meeting"):
+        sched = meeting_div.find("div", class_="meeting-schedule")
+        days = sched.find("div", class_="ui-pillbox-summary").get_text(strip=True)
+        times = sched.find_all("span")[1].get_text(strip=True)
+        if days == "None":
+            meetings.append("TBA")
+        else:
+            abbr = "".join(day_map[d] for d in days.split(","))
+            meetings.append(f"{abbr} {times}")
+    return "; ".join(meetings)
 
-try:
-    # 1) Go to the initial class-search landing page
-    driver.get(
-        "https://reg.oci.fhda.edu/StudentRegistrationSsb/ssb/classSearch/classSearch"
-    )
 
-    # 2) Click the "Browse Classes" link to pick a term
-    wait.until(EC.element_to_be_clickable((By.ID, "classSearchLink"))).click()
+def parse_html(html: str) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "html.parser")
+    headers = [th.get_text(strip=True) for th in soup.select("#searchResults thead th")]
+    data = []
+    for tr in soup.select("#searchResults tbody tr"):
+        row = []
+        for td in tr.find_all("td"):
+            if td.get("data-property") == "meetingTime":
+                row.append(parse_meeting_cell(str(td)))
+            else:
+                row.append(td.get_text(strip=True))
+        data.append(row)
+    return pd.DataFrame(data, columns=headers)
 
-    # 3) Wait for the term-combobox (Select2) to appear
-    wait.until(EC.presence_of_element_located((By.ID, "s2id_txt_term")))
-    # Open the dropdown
-    driver.find_element(By.CSS_SELECTOR, "#s2id_txt_term .select2-choice").click()
-    # Click the desired term
-    term_option = wait.until(EC.element_to_be_clickable((
-        By.XPATH,
-        f"//div[contains(@class,'select2-result-label') and normalize-space()='{TERM_NAME}']"
-    )))
-    term_option.click()
 
-    # 4) Click Continue to confirm term
-    wait.until(EC.element_to_be_clickable((By.ID, "term-go"))).click()
+def parse_offline(html_path: str, output_csv: str):
+    html = open(html_path, encoding="utf-8").read()
+    df = parse_html(html)
+    df.to_csv(output_csv, index=False)
+    print(f"✅ Parsed offline HTML and wrote {len(df)} rows to {output_csv}")
 
-    # 5) Now click Search on the class-search page
-    search_btn = wait.until(EC.element_to_be_clickable((By.ID, "search-go")))
-    search_btn.click()
 
-    # 6) Wait for the results table
-    wait.until(EC.presence_of_element_located((By.ID, "searchResults")))
+def scrape_online(term: str, output_csv: str, save_html: str = None, debug: bool = False):
+    options = Options()
+    # options.add_argument("--headless")
+    options.add_argument("--start-maximized")
+    driver = webdriver.Chrome(options=options)
+    wait = WebDriverWait(driver, 20)
 
-    # 7) Set "Per Page" to 50
-    perpage = wait.until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, "select.page-size-select"))
-    )
-    Select(perpage).select_by_visible_text("50")
-    time.sleep(2)  # let table redraw
+    try:
+        driver.get("https://reg.oci.fhda.edu/StudentRegistrationSsb/ssb/classSearch/classSearch")
+        wait.until(EC.element_to_be_clickable((By.ID, "classSearchLink"))).click()
+        wait.until(EC.presence_of_element_located((By.ID, "s2id_txt_term")))
+        driver.find_element(By.CSS_SELECTOR, "#s2id_txt_term .select2-choice").click()
+        wait.until(EC.element_to_be_clickable((By.XPATH, f"//div[contains(@class,'select2-result-label') and normalize-space()='{term}']"))).click()
+        wait.until(EC.element_to_be_clickable((By.ID, "term-go"))).click()
+        wait.until(EC.presence_of_element_located((By.ID, "search-go"))).click()
+        wait.until(EC.presence_of_element_located((By.ID, "searchResults")))
+        Select(wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "select.page-size-select")))).select_by_visible_text("50")
+        time.sleep(2)
 
-    # 8) Scrape headers
-    headers = [th.text for th in driver.find_elements(
-        By.CSS_SELECTOR, "#searchResults thead th"
-    )]
+        if save_html:
+            open(save_html, "w", encoding="utf-8").write(driver.page_source)
+            print(f"✅ Saved start page HTML to {save_html}")
 
-    # 9) Paginate through all pages, collecting rows
-    all_rows = []
-    while True:
-        for tr in driver.find_elements(By.CSS_SELECTOR, "#searchResults tbody tr"):
-            row = [td.text.strip() for td in tr.find_elements(By.TAG_NAME, "td")]
-            all_rows.append(row)
+        all_rows = []
+        page = 1
+        while True:
+            html = driver.page_source
+            df_page = parse_html(html)
+            all_rows.extend(df_page.values.tolist())
 
-        # try clicking "Next" (arrow icon)
-        next_btn = driver.find_element(By.CSS_SELECTOR, ".paging-container .next")
-        if not next_btn.is_enabled() or "disabled" in next_btn.get_attribute("class"):
-            # no more pages
-            break
-        next_btn.click()
-        # wait for the page number input to update to the next value
-        # grab the page-number input, read its value, and wait until it matches the incremented page
-        try:
-            # find the page number input
-            page_input = wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".page-number"))
-            )
-            # after click, wait until its value increments
-            current = int(page_input.get_attribute("value"))
-            wait.until(lambda d: int(d.find_element(By.CSS_SELECTOR, ".page-number").get_attribute("value")) == current + 1)
-        except Exception:
-            # fallback brief sleep
-            time.sleep(1)
+            pd.DataFrame(all_rows, columns=df_page.columns).to_csv(output_csv, index=False)
+            print(f"✅ Page {page} parsed, rows so far: {len(all_rows)} → {output_csv}")
 
-    # 10) Export to CSV) Export to CSV
-    df = pd.DataFrame(all_rows, columns=headers)
-    df.to_csv(OUTPUT_CSV, index=False)
-    print(f"✅ Wrote {len(df)} rows to {OUTPUT_CSV}")
+            try:
+                next_btn = driver.find_element(By.CSS_SELECTOR, ".paging-container .next")
+                if not next_btn.is_enabled() or "disabled" in next_btn.get_attribute("class"):
+                    break
+                table = driver.find_element(By.ID, "searchResults")
+                next_btn.click()
+                # wait for old table to go stale or timeout
+                wait.until(EC.staleness_of(table))
+            except TimeoutException:
+                print(f"⚠️ Timeout waiting for page change at page {page}")
+                if debug:
+                    debug_file = f"debug_page_{page}.html"
+                    open(debug_file, "w", encoding="utf-8").write(driver.page_source)
+                    print(f"🔍 Saved debug HTML to {debug_file}")
+                else:
+                    time.sleep(3)
+            page += 1
 
-finally:
-    # Keeps the browser open for inspection
-    pass
+        print(f"🎉 Completed scraping {len(all_rows)} rows across {page} pages.")
+
+    except WebDriverException as e:
+        print(f"❌ WebDriver error: {e}")
+    finally:
+        # driver.quit()  # uncomment to close browser
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="mode")
+
+    p_off = sub.add_parser("offline", help="Parse saved HTML page offline")
+    p_off.add_argument("html")
+    p_off.add_argument("output")
+
+    p_on = sub.add_parser("online", help="Run Selenium for a term")
+    p_on.add_argument("--term", default="2025 Fall De Anza")
+    p_on.add_argument("--output", required=True)
+    p_on.add_argument("--save-html")
+    p_on.add_argument("--debug", action="store_true", help="Save page snapshots on pagination errors")
+
+    args = parser.parse_args()
+    if args.mode == "offline":
+        parse_offline(args.html, args.output)
+    else:
+        scrape_online(args.term, args.output, args.save_html, args.debug)
+
+
+if __name__ == "__main__":
+    main()
